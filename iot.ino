@@ -1,15 +1,22 @@
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <PubSubClient.h>
 
-// Replace these with your Wi-Fi credentials
-const char* ssid = "A54";
-const char* password = "kumrute123";
+// MQTT config buffers (filled via portal)
+char mqtt_server[40] = "";
+char mqtt_user[40] = "iot_user";
+char mqtt_pass[40] = "pass";
+char mqtt_topic_pub[40] = "home/sound/level";
+char mqtt_topic_color[60];
+char mqtt_topic_registration[40] = "home/sensor/register";
+char mqtt_topic_response[60];
 
-const char* mqtt_server = "192.168.239.51"; 
-const char* mqtt_user = "iot_user";
-const char* mqtt_password = "pass";
-const char* mqtt_topic_pub = "home/sound/level";
-const char* mqtt_topic_sub = "home/led/color";
+char esp_location[40] = "";
+
+String hwid;
+
+volatile bool registrationSuccess = false;
+volatile bool registrationFailed = false;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -28,42 +35,121 @@ void setColor(String color) {
   #endif
 }
 
+// MQTT message callback
 void callback(char* topic, byte* payload, unsigned int length) {
   payload[length] = '\0';
   String message = (char*)payload;
+  String topicStr = String(topic);
+
   Serial.print("Received: ");
+  Serial.print(topicStr);
+  Serial.print(" => ");
   Serial.println(message);
-  setColor(message);
+
+  if (topicStr == String(mqtt_topic_response)) {
+    if (message == "OK") {
+      registrationSuccess = true;
+    } else {
+      registrationFailed = true;
+    }
+  } else if (topicStr == String(mqtt_topic_color)) {
+    setColor(message);  // LED control
+  }
 }
 
+// Setup WiFi + MQTT portal
 void setup_wifi() {
-  delay(10);
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.println("...");
+  WiFiManager wm;
+
+  const char* apName = "ESP32_Setup";
+  const char* apPassword = "esp32config";
+
+  wm.resetSettings();  // Always show portal on boot (for dev)
+
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT Username", mqtt_user, 40);
+  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Password", mqtt_pass, 40);
+  WiFiManagerParameter custom_location("location", "Location", esp_location, 40);
+
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_pass);
+  wm.addParameter(&custom_location);
+
+  if (!wm.autoConnect(apName, apPassword)) {
+    Serial.println("Failed to connect or portal timeout");
+    ESP.restart();
   }
-  Serial.print("\nWiFi connected. IP:");
+
+  strncpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
+  strncpy(mqtt_user, custom_mqtt_user.getValue(), sizeof(mqtt_user));
+  strncpy(mqtt_pass, custom_mqtt_pass.getValue(), sizeof(mqtt_pass));
+  strncpy(esp_location, custom_location.getValue(), sizeof(esp_location));
+
+  Serial.println("Connected to WiFi!");
+  Serial.print("Local IP: ");
   Serial.println(WiFi.localIP());
 }
 
+// Ensure MQTT connection
 void reconnect() {
   while (!client.connected()) {
     Serial.println("Attempting MQTT connection...");
 
     String clientId = "ESP32Client-";
-    clientId += String(random(0xffff), HEX);  // add randomness
+    clientId += String(random(0xffff), HEX);
 
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    mac.toLowerCase();
+    hwid = mac;
+
+    String responseTopic = "/home/sensor/" + hwid + "/response";
+    strncpy(mqtt_topic_response, responseTopic.c_str(), sizeof(mqtt_topic_response));
+    
+    String colorTopic = "home/sensor/" + hwid + "/color";
+    strncpy(mqtt_topic_color, colorTopic.c_str(), sizeof(mqtt_topic_color));
 
     Serial.print("My clientid: ");
     Serial.println(clientId);
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_password)) {
-      Serial.println("Connected to MQTT...");
-      client.subscribe(mqtt_topic_sub);
+
+    Serial.print("MQTT server: ");
+    Serial.println(mqtt_server);
+    Serial.print("MQTT username: ");
+    Serial.println(mqtt_user);
+    Serial.print("MQTT pub topic: ");
+    Serial.println(mqtt_topic_pub);
+    Serial.print("MQTT sub topic: ");
+    Serial.println(mqtt_topic_color);
+    Serial.print("MQTT registration response topic: ");
+    Serial.println(mqtt_topic_response);
+
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("Connected to MQTT!");
+      client.subscribe(mqtt_topic_color);       // LED control
+      client.subscribe(mqtt_topic_response);  // Registration response
+
+      // Format registration message
+      String payload = "{\"hwid\":\"" + hwid + "\",\"location\":\"" + String(esp_location) + "\"}";
+      Serial.print("Publishing registration payload: ");
+      Serial.println(payload);
+
+      // Publish registration message
+      client.publish(mqtt_topic_registration, payload.c_str());
+
+      // delay(5000);
+
+      // if (registrationSuccess) {
+      //   Serial.println("Registration successful.");
+      // } else {
+      //   Serial.println("No OK received, retrying...");
+      //   delay(2000);  // wait before re-publishing
+      // }
+
     } else {
-      Serial.print("Failed, rc=");
-      Serial.println(client.state());
+      Serial.print("MQTT connect failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" — retrying in 2 seconds...");
       delay(2000);
     }
   }
@@ -71,39 +157,30 @@ void reconnect() {
 
 void setup() {
   Serial.begin(115200);
-  //pixels.begin();
-  //pixels.setBrightness(50);  // Set brightness (0–255)
-  //setColor("wait");
 
   setup_wifi();
 
-  client.setServer("192.168.239.51", 1883);
+  client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
 }
 
+// Main loop
 void loop() {
   if (!client.connected()) {
     reconnect();
   }
   client.loop();
 
-  // Read sound level
-  //int raw = analogRead(micPin);
-
-  int dB = random(30, 90);  // Normal conversation to busy street
-
-  // Occasionally simulate a loud event
+  // Simulated sound level
+  int dB = random(30, 90);
   if (random(0, 100) < 5) {
-    dB = random(90, 110);  // simulate a shout or vacuum cleaner
+    dB = random(90, 110);
   }
-  char msg[10];
-  snprintf(msg, sizeof(msg), "%d", dB);
 
-  // Publish to MQTT
-  client.publish(mqtt_topic_pub, msg);
-  Serial.print("Sent: ");
-  Serial.println(msg);
+  String payload = "{\"hwid\":\"" + hwid + "\",\"level\":\"" + String(dB) + "\"}";
+  Serial.print("Publishing microphone payload: ");
+  Serial.println(payload);
+  client.publish(mqtt_topic_pub, payload.c_str());
 
-  delay(5000);  // Every 5 seconds
+  delay(5000);
 }
-

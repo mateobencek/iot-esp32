@@ -6,12 +6,13 @@
 char mqtt_server[40] = "";
 char mqtt_user[40] = "iot_user";
 char mqtt_pass[40] = "pass";
+char esp_location[40] = "";
+
 char mqtt_topic_pub[40] = "home/sound/level";
 char mqtt_topic_color[60];
 char mqtt_topic_registration[40] = "home/sensor/register";
 char mqtt_topic_response[60];
 
-char esp_location[40] = "";
 
 String hwid;
 
